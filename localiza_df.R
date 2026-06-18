@@ -1,25 +1,41 @@
 # ============================================================================
-# localiza_df.R
+# localiza_df.R  —  padronização de RA do DF (determinística + Machine Learning)
 # ----------------------------------------------------------------------------
-# Padronização de endereços (ID_BAIRRO) para Região Administrativa (RA) do DF
-# a partir da tabela da CODEPLAN.
+# Padroniza endereços/bairros (texto livre) para a Região Administrativa (RA)
+# do Distrito Federal. Trabalha em DUAS camadas que se complementam:
 #
-# PLANILHAS AUXILIARES NECESSÁRIAS:
-#   auxiliares/tabela_localizacao_codeplan_2020.csv  — tabela de localidades
-#   auxiliares/CODQGIS_RA.xlsx                       — fonte canônica de RAs
+#   1) MOTOR DETERMINÍSTICO  -> localiza_df()
+#      match exato + regra por token + fuzzy (adist). Robusto e auditável.
 #
-# FUNÇÃO PRINCIPAL:
-#   localiza_df()   →  antigo vincular_regiao_administrativa_codeplan_v2()
+#   2) CAMADA DE ML (opcional, aprende com o tempo)  -> localiza_df_ml()
+#      Roda o motor determinístico e, nos casos incertos (precisa_revisao_manual),
+#      aplica um classificador de texto treinado nas correções humanas
+#      (n-gramas de caractere + regressão logística multinomial / glmnet).
+#      Quanto mais você revisa e retreina, melhor ele fica ("aprende gradual").
+#      Sem modelo treinado, localiza_df_ml() devolve exatamente o resultado
+#      determinístico (degradação limpa).
 #
-# OUTRAS FUNÇÕES EXPORTADAS:
-#   vincular_regiao_saude()
-#   auditoria_vinculo_regiao_administrativa()
-#   diagnostico_vinculo_ra()
-#   testar_vinculo_ra_v2()
-#   dicionario_ra_regiao_saude()
-#   padronizar_ra_qgis()
-#   carregar_ra_qgis()
-#   construir_referencia_codeplan_v2()
+# ARQUIVOS AUXILIARES NECESSÁRIOS (na MESMA pasta deste .R):
+#   tabela_localizacao_codeplan_2020.csv  — tabela de localidades da CODEPLAN
+#   CODQGIS_RA.xlsx                       — fonte canônica da grafia das RAs
+#
+# ARQUIVOS GERADOS PELO CICLO DE ML (criados automaticamente):
+#   ra_treino_rotulos.csv  — base de rótulos (a "memória" do modelo)
+#   modelo_ra.rds          — o modelo treinado
+#
+# DEPENDÊNCIAS:
+#   Sempre:    dplyr, stringr, stringi, readr, tibble, readxl
+#   Só p/ ML:  tidymodels, textrecipes, glmnet  (carregados de forma lazy)
+#     install.packages(c("tidymodels","textrecipes","glmnet"))
+#
+# FUNÇÃO PRINCIPAL (recomendada): localiza_df_ml()
+# Demais: localiza_df(), vincular_regiao_saude(),
+#   auditoria_vinculo_regiao_administrativa(), diagnostico_vinculo_ra(),
+#   bootstrap_rotulos_v2(), coletar_rotulos_para_revisao(),
+#   registrar_rotulos_ra(), treinar_modelo_ra(), avaliar_modelo_ra(),
+#   prever_ra_ml(), padronizar_ra_qgis(), carregar_ra_qgis().
+#
+# Ver o passo a passo prático no README.md.
 # ============================================================================
 
 # ----------------------------------------------------------------------------
@@ -55,7 +71,7 @@
 
 # Lê e memoiza a tabela CODQGIS_RA.xlsx (RA, COD_RA_QGIS, REGIAO_SAUDE).
 # Toda a nomenclatura de RA do projeto deve se padronizar por ela.
-carregar_ra_qgis <- function(caminho_qgis = "auxiliares/CODQGIS_RA.xlsx") {
+carregar_ra_qgis <- function(caminho_qgis = "CODQGIS_RA.xlsx") {
   if (!is.null(.cache_ra_qgis[[caminho_qgis]])) return(.cache_ra_qgis[[caminho_qgis]])
   tab <- readxl::read_xlsx(caminho_qgis) |>
     dplyr::transmute(RA, COD_RA_QGIS, REGIAO_SAUDE, ra_chave = .chave_ra(RA))
@@ -83,7 +99,7 @@ carregar_ra_qgis <- function(caminho_qgis = "auxiliares/CODQGIS_RA.xlsx") {
 
 # Converte qualquer grafia de RA para a grafia EXATA do CODQGIS_RA.xlsx.
 # Tenta chave direta; se falhar, usa .aliases_grafia_qgis.
-padronizar_ra_qgis <- function(x, caminho_qgis = "auxiliares/CODQGIS_RA.xlsx") {
+padronizar_ra_qgis <- function(x, caminho_qgis = "CODQGIS_RA.xlsx") {
   mapa  <- carregar_ra_qgis(caminho_qgis)
   ch    <- .chave_ra(x)
   alvo  <- ifelse(ch %in% mapa$ra_chave, ch,
@@ -274,7 +290,7 @@ padronizar_ra_qgis <- function(x, caminho_qgis = "auxiliares/CODQGIS_RA.xlsx") {
 # (regiao_administrativa + localidade). Descarta colunas pré-computadas
 # (ra_norm/texto_busca_norm), corrompidas por vírgulas em descricao_area_bairro.
 construir_referencia_codeplan_v2 <- function(
-    caminho_tabela = "auxiliares/tabela_localizacao_codeplan_2020.csv") {
+    caminho_tabela = "tabela_localizacao_codeplan_2020.csv") {
 
   bruto <- suppressWarnings(readr::read_delim(
     caminho_tabela, delim = ",", show_col_types = FALSE,
@@ -353,8 +369,8 @@ construir_referencia_codeplan_v2 <- function(
 localiza_df <- function(
     df,
     col_bairro     = "ID_BAIRRO",
-    caminho_tabela = "auxiliares/tabela_localizacao_codeplan_2020.csv",
-    caminho_qgis   = "auxiliares/CODQGIS_RA.xlsx",
+    caminho_tabela = "tabela_localizacao_codeplan_2020.csv",
+    caminho_qgis   = "CODQGIS_RA.xlsx",
     limiar_fuzzy   = 0.86,
     margem_minima  = 0.05,
     max_janela     = 4) {
@@ -547,7 +563,7 @@ dicionario_ra_regiao_saude <- function() {
 # Usa o CODQGIS_RA.xlsx como fonte primária; dicionario_ra_regiao_saude() é
 # mantido como fallback histórico.
 vincular_regiao_saude <- function(df, col_ra = "regiao_adm",
-                                  caminho_qgis = "auxiliares/CODQGIS_RA.xlsx") {
+                                  caminho_qgis = "CODQGIS_RA.xlsx") {
   if (!col_ra %in% names(df)) {
     stop(sprintf("Coluna '%s' não encontrada em df.", col_ra))
   }
@@ -608,7 +624,7 @@ diagnostico_vinculo_ra <- function(df_result, col_verdade) {
 
 # Testes de regressão: casos fáceis, abreviados, com typo e ambíguos.
 testar_vinculo_ra_v2 <- function(
-    caminho_tabela = "auxiliares/tabela_localizacao_codeplan_2020.csv") {
+    caminho_tabela = "tabela_localizacao_codeplan_2020.csv") {
   casos <- tibble::tribble(
     ~endereco,                       ~esperado,
     "QNN 18 Ceilândia",              "CEILÂNDIA",
@@ -641,3 +657,393 @@ testar_vinculo_ra_v2 <- function(
            (!is.na(obtido) & obtido == esperado)
     )
 }
+
+# ============================================================================
+# CAMADA DE MACHINE LEARNING (aprendizagem supervisionada incremental)
+# ----------------------------------------------------------------------------
+# COMPLEMENTA localiza_df() — não a substitui. Ciclo human-in-the-loop:
+#   1) localiza_df() resolve o fácil; sobra um RESÍDUO incerto.
+#   2) Um humano revisa o resíduo -> cada correção vira um RÓTULO.
+#   3) Os rótulos acumulados treinam um classificador de texto.
+#   4) Nas próximas execuções o modelo cobre parte do resíduo sozinho.
+# A cada ciclo a base de rótulos cresce e o modelo MELHORA.
+#
+# Por que n-gramas de caractere? Endereços são curtos e cheios de abreviações/
+# erros ("SAMABAIA", "CEIL SUL", "P NORTE"); n-gramas (2..4) são robustos a typos.
+# ============================================================================
+
+# Caminhos padrão dos artefatos de ML (na pasta deste .R).
+.CAMINHO_ROTULOS_RA <- "ra_treino_rotulos.csv"
+.CAMINHO_MODELO_RA  <- "modelo_ra.rds"
+
+# Garante as dependências de ML; mensagem única e clara se faltar.
+.checar_pacotes_ml <- function(extra = character(0)) {
+  necessarios <- c("recipes", "parsnip", "workflows", "textrecipes",
+                   "glmnet", "tibble", "dplyr", extra)
+  faltam <- necessarios[!vapply(necessarios, requireNamespace,
+                                logical(1), quietly = TRUE)]
+  if (length(faltam) > 0) {
+    stop("Pacotes de ML ausentes: ", paste(faltam, collapse = ", "),
+         "\nInstale com: install.packages(c(",
+         paste(sprintf('\"%s\"', faltam), collapse = ", "), "))")
+  }
+  invisible(TRUE)
+}
+
+# Esquema da base de rótulos. `endereco_padronizado` é a chave de treino
+# (texto que o modelo enxerga); `regiao_adm_correta` é o alvo (label).
+.colunas_rotulos_ra <- function() {
+  c("endereco_original", "endereco_padronizado", "regiao_adm_correta",
+    "fonte", "data_rotulo")
+}
+
+# ----------------------------------------------------------------------------
+# 1. COLETA DE RÓTULOS
+# ----------------------------------------------------------------------------
+
+# Exporta os casos que precisam de revisão manual como CSV-template para um
+# humano preencher a coluna `regiao_adm_correta`. df_result = saída de
+# localiza_df() ou localiza_df_ml().
+coletar_rotulos_para_revisao <- function(
+    df_result,
+    caminho_saida = "ra_para_revisar.csv") {
+  obrig <- c("endereco_original", "endereco_padronizado",
+             "regiao_adm", "metodo_vinculo", "score_confianca",
+             "possiveis_matches", "precisa_revisao_manual")
+  faltam <- setdiff(obrig, names(df_result))
+  if (length(faltam) > 0) {
+    stop("df_result não parece vir de localiza_df(); faltam colunas: ",
+         paste(faltam, collapse = ", "))
+  }
+
+  template <- df_result |>
+    dplyr::filter(.data$precisa_revisao_manual %in% TRUE) |>
+    dplyr::distinct(.data$endereco_padronizado, .keep_all = TRUE) |>
+    dplyr::transmute(
+      endereco_original,
+      endereco_padronizado,
+      ra_sugerida        = regiao_adm,     # palpite do motor (pré-preenchido)
+      regiao_adm_correta = NA_character_,  # <- HUMANO PREENCHE AQUI
+      metodo_vinculo,
+      score_confianca,
+      possiveis_matches
+    ) |>
+    dplyr::arrange(score_confianca)
+
+  dir.create(dirname(caminho_saida), recursive = TRUE, showWarnings = FALSE)
+  readr::write_excel_csv(template, caminho_saida)
+  message("Casos para revisão: ", nrow(template), " -> ", caminho_saida,
+          "\nPreencha 'regiao_adm_correta' e chame registrar_rotulos_ra().")
+  invisible(caminho_saida)
+}
+
+# Semeia a base de rótulos com acertos de ALTA confiança do motor (match exato /
+# regra forte). Dá treino ao modelo desde o dia 1, sem esperar revisão manual.
+bootstrap_rotulos_v2 <- function(
+    df_result,
+    caminho_store = .CAMINHO_ROTULOS_RA,
+    limiar_confianca = 0.95) {
+  conf <- df_result |>
+    dplyr::filter(!is.na(.data$regiao_adm),
+                  !(.data$precisa_revisao_manual %in% TRUE),
+                  .data$score_confianca >= limiar_confianca) |>
+    dplyr::distinct(.data$endereco_padronizado, .keep_all = TRUE) |>
+    dplyr::transmute(
+      endereco_original,
+      endereco_padronizado,
+      regiao_adm_correta = regiao_adm,
+      fonte       = "bootstrap_v2",
+      data_rotulo = as.character(Sys.Date())
+    )
+  .gravar_rotulos(conf, caminho_store)
+}
+
+# Lê um CSV revisado por humano (com `regiao_adm_correta` preenchida) e o
+# incorpora à base de rótulos.
+registrar_rotulos_ra <- function(
+    caminho_revisado,
+    caminho_store = .CAMINHO_ROTULOS_RA) {
+  rev <- readr::read_csv(caminho_revisado, show_col_types = FALSE)
+  if (!"regiao_adm_correta" %in% names(rev)) {
+    stop("O arquivo revisado precisa ter a coluna 'regiao_adm_correta'.")
+  }
+  novos <- rev |>
+    dplyr::filter(!is.na(.data$regiao_adm_correta),
+                  nzchar(stringr::str_squish(.data$regiao_adm_correta))) |>
+    dplyr::transmute(
+      endereco_original = if ("endereco_original" %in% names(rev))
+        .data$endereco_original else NA_character_,
+      endereco_padronizado = .norm_ra(
+        if ("endereco_padronizado" %in% names(rev))
+          .data$endereco_padronizado else .data$endereco_original),
+      regiao_adm_correta = stringr::str_squish(.data$regiao_adm_correta),
+      fonte       = "revisao_manual",
+      data_rotulo = as.character(Sys.Date())
+    )
+  if (nrow(novos) == 0) {
+    warning("Nenhuma linha com 'regiao_adm_correta' preenchida; nada a registrar.")
+    return(invisible(caminho_store))
+  }
+  .gravar_rotulos(novos, caminho_store)
+}
+
+# Append + dedup da base de rótulos. Grafia do alvo padronizada pelo
+# CODQGIS_RA.xlsx. Dedup por endereco_padronizado: a entrada MAIS RECENTE vence
+# (correções humanas sobrescrevem o bootstrap).
+.gravar_rotulos <- function(novos, caminho_store) {
+  novos <- novos |>
+    dplyr::mutate(
+      endereco_padronizado = .norm_ra(.data$endereco_padronizado),
+      regiao_adm_correta   = padronizar_ra_qgis(.data$regiao_adm_correta)
+    ) |>
+    dplyr::filter(!is.na(.data$endereco_padronizado),
+                  !is.na(.data$regiao_adm_correta))
+
+  antigos <- if (file.exists(caminho_store)) {
+    readr::read_csv(caminho_store, show_col_types = FALSE)
+  } else {
+    tibble::tibble()
+  }
+
+  combinado <- dplyr::bind_rows(antigos, novos) |>
+    dplyr::mutate(.ordem = dplyr::row_number()) |>
+    dplyr::group_by(.data$endereco_padronizado) |>
+    dplyr::slice_max(.data$.ordem, n = 1, with_ties = FALSE) |>
+    dplyr::ungroup() |>
+    dplyr::select(-".ordem") |>
+    dplyr::arrange(.data$regiao_adm_correta, .data$endereco_padronizado)
+
+  dir.create(dirname(caminho_store), recursive = TRUE, showWarnings = FALSE)
+  readr::write_excel_csv(combinado, caminho_store)
+  message("Base de rótulos: ", nrow(combinado), " exemplos (",
+          dplyr::n_distinct(combinado$regiao_adm_correta), " RAs) -> ",
+          caminho_store)
+  invisible(caminho_store)
+}
+
+# ----------------------------------------------------------------------------
+# 2. TREINO DO MODELO
+# ----------------------------------------------------------------------------
+
+# Treina o classificador de RA a partir da base de rótulos e o salva em disco.
+# Pipeline: recipe -> n-gramas de caractere (2..n) -> tf-idf -> glmnet multinom.
+# Retorna o caminho do modelo salvo, ou NULL se não houver dados suficientes
+# (nesse caso o vínculo segue só determinístico).
+treinar_modelo_ra <- function(
+    caminho_store  = .CAMINHO_ROTULOS_RA,
+    caminho_modelo = .CAMINHO_MODELO_RA,
+    penalty        = 0.01,
+    n_gram         = 4L,
+    max_tokens     = 2000L,
+    min_exemplos   = 30L) {
+  .checar_pacotes_ml()
+
+  if (!file.exists(caminho_store)) {
+    message("Sem base de rótulos (", caminho_store, "). ",
+            "Gere rótulos (bootstrap_rotulos_v2 / registrar_rotulos_ra) antes.")
+    return(invisible(NULL))
+  }
+
+  dados <- readr::read_csv(caminho_store, show_col_types = FALSE) |>
+    dplyr::transmute(
+      texto      = .norm_ra(.data$endereco_padronizado),
+      regiao_adm = padronizar_ra_qgis(.data$regiao_adm_correta)
+    ) |>
+    dplyr::filter(!is.na(.data$texto), !is.na(.data$regiao_adm)) |>
+    dplyr::distinct()
+
+  n_classes <- dplyr::n_distinct(dados$regiao_adm)
+  if (nrow(dados) < min_exemplos || n_classes < 2) {
+    message("Rótulos insuficientes para treinar (", nrow(dados),
+            " exemplos, ", n_classes, " RAs; mínimo ", min_exemplos,
+            " e 2 RAs). Mantendo só o determinístico.")
+    return(invisible(NULL))
+  }
+
+  dados$regiao_adm <- factor(dados$regiao_adm)
+
+  rec <- recipes::recipe(regiao_adm ~ texto, data = dados) |>
+    textrecipes::step_tokenize(
+      texto, token = "character_shingle",
+      options = list(n = n_gram, n_min = 2L)) |>
+    textrecipes::step_tokenfilter(texto, max_tokens = max_tokens) |>
+    textrecipes::step_tfidf(texto)
+
+  mod <- parsnip::multinom_reg(penalty = penalty, mixture = 1) |>
+    parsnip::set_engine("glmnet") |>
+    parsnip::set_mode("classification")
+
+  wf <- workflows::workflow() |>
+    workflows::add_recipe(rec) |>
+    workflows::add_model(mod)
+
+  modelo <- tryCatch(
+    parsnip::fit(wf, data = dados),
+    error = function(e) {
+      message("Falha ao treinar o modelo de RA: ", conditionMessage(e))
+      NULL
+    })
+  if (is.null(modelo)) return(invisible(NULL))
+
+  dir.create(dirname(caminho_modelo), recursive = TRUE, showWarnings = FALSE)
+  saveRDS(
+    list(workflow = modelo, classes = levels(dados$regiao_adm),
+         n_exemplos = nrow(dados), penalty = penalty, n_gram = n_gram,
+         treinado_em = Sys.time()),
+    caminho_modelo)
+  .cache_modelo_ra[[caminho_modelo]] <- NULL  # invalida cache
+  message("Modelo de RA treinado: ", nrow(dados), " exemplos, ",
+          n_classes, " RAs -> ", caminho_modelo)
+  invisible(caminho_modelo)
+}
+
+# Carrega (e memoiza) o modelo salvo. NULL silencioso se não houver.
+.cache_modelo_ra <- new.env(parent = emptyenv())
+carregar_modelo_ra <- function(caminho_modelo = .CAMINHO_MODELO_RA) {
+  if (!is.null(.cache_modelo_ra[[caminho_modelo]]))
+    return(.cache_modelo_ra[[caminho_modelo]])
+  if (!file.exists(caminho_modelo)) return(NULL)
+  obj <- readRDS(caminho_modelo)
+  .cache_modelo_ra[[caminho_modelo]] <- obj
+  obj
+}
+
+# ----------------------------------------------------------------------------
+# 3. PREDIÇÃO
+# ----------------------------------------------------------------------------
+
+# Prediz a RA para um vetor de endereços (texto livre): classe mais provável e
+# sua probabilidade. Resolve uma vez por texto único.
+prever_ra_ml <- function(enderecos, modelo = NULL,
+                         caminho_modelo = .CAMINHO_MODELO_RA) {
+  .checar_pacotes_ml()
+  if (is.null(modelo)) modelo <- carregar_modelo_ra(caminho_modelo)
+  n <- length(enderecos)
+  if (is.null(modelo)) {
+    return(tibble::tibble(regiao_adm_ml = rep(NA_character_, n),
+                          prob_ml = rep(NA_real_, n)))
+  }
+  txt <- .norm_ra(enderecos)
+  unicos <- unique(txt[!is.na(txt)])
+  if (length(unicos) == 0) {
+    return(tibble::tibble(regiao_adm_ml = rep(NA_character_, n),
+                          prob_ml = rep(NA_real_, n)))
+  }
+  novo <- tibble::tibble(texto = unicos)
+  cls  <- predict(modelo$workflow, novo, type = "class")$.pred_class
+  prob <- predict(modelo$workflow, novo, type = "prob")
+  prob_max <- apply(as.matrix(prob), 1, max)
+
+  mapa <- tibble::tibble(texto = unicos,
+                         regiao_adm_ml = as.character(cls),
+                         prob_ml = prob_max)
+  idx <- match(txt, mapa$texto)
+  tibble::tibble(regiao_adm_ml = mapa$regiao_adm_ml[idx],
+                 prob_ml = mapa$prob_ml[idx])
+}
+
+# ----------------------------------------------------------------------------
+# 4. VÍNCULO HÍBRIDO (determinístico + ML no resíduo)  <- FUNÇÃO PRINCIPAL
+# ----------------------------------------------------------------------------
+
+# Roda localiza_df() e, nos casos marcados para revisão, aplica o modelo de ML
+# quando a probabilidade >= limiar_ml. Grafia final padronizada pelo
+# CODQGIS_RA.xlsx. Saída = colunas de localiza_df() + origem_classificacao + prob_ml.
+localiza_df_ml <- function(
+    df,
+    col_bairro     = "ID_BAIRRO",
+    caminho_tabela = "tabela_localizacao_codeplan_2020.csv",
+    caminho_qgis   = "CODQGIS_RA.xlsx",
+    caminho_modelo = .CAMINHO_MODELO_RA,
+    limiar_ml      = 0.70,   # mínimo p/ aceitar predição do ML
+    limiar_revisao = 0.85) { # abaixo disso, ainda marca p/ revisão humana
+
+  # 1) Camada determinística (intacta, auditável).
+  out <- localiza_df(df, col_bairro = col_bairro,
+                     caminho_tabela = caminho_tabela, caminho_qgis = caminho_qgis)
+  out$origem_classificacao <- ifelse(is.na(out$regiao_adm),
+                                     NA_character_, "deterministica")
+  out$prob_ml <- NA_real_
+
+  modelo <- carregar_modelo_ra(caminho_modelo)
+  if (is.null(modelo)) {
+    message("Sem modelo de ML treinado; resultado é 100% determinístico. ",
+            "Treine com treinar_modelo_ra() para ativar a camada de ML.")
+    return(out)
+  }
+
+  # 2) Resíduo: o que o motor não resolveu com confiança.
+  residuo <- which(out$precisa_revisao_manual %in% TRUE)
+  if (length(residuo) == 0) return(out)
+
+  pred <- prever_ra_ml(out$endereco_padronizado[residuo], modelo = modelo)
+  aceita <- !is.na(pred$regiao_adm_ml) & pred$prob_ml >= limiar_ml
+  alvo <- residuo[aceita]
+
+  if (length(alvo) > 0) {
+    ra_ml <- padronizar_ra_qgis(pred$regiao_adm_ml[aceita], caminho_qgis)
+    out$regiao_adm[alvo]             <- ra_ml
+    out$regiao_adm_chave[alvo]       <- .chave_ra(ra_ml)
+    out$metodo_vinculo[alvo]         <- "ml_glmnet"
+    out$score_confianca[alvo]        <- round(pred$prob_ml[aceita], 3)
+    out$origem_classificacao[alvo]   <- "ml_glmnet"
+    out$prob_ml[alvo]                <- round(pred$prob_ml[aceita], 3)
+    out$texto_usado_para_match[alvo] <- out$endereco_padronizado[alvo]
+    out$possiveis_matches[alvo]      <- NA_character_
+    out$precisa_revisao_manual[alvo] <- pred$prob_ml[aceita] < limiar_revisao
+  }
+  out
+}
+
+# ----------------------------------------------------------------------------
+# 5. AVALIAÇÃO (validação cruzada da base de rótulos)
+# ----------------------------------------------------------------------------
+
+# Estima a acurácia do modelo por validação cruzada k-fold sobre os rótulos.
+# Útil para acompanhar a evolução do aprendizado a cada ciclo.
+avaliar_modelo_ra <- function(
+    caminho_store = .CAMINHO_ROTULOS_RA,
+    k = 5L, penalty = 0.01, n_gram = 4L, max_tokens = 2000L) {
+  .checar_pacotes_ml(extra = c("rsample", "yardstick", "tune"))
+  if (!file.exists(caminho_store)) {
+    message("Sem base de rótulos para avaliar."); return(invisible(NULL))
+  }
+  dados <- readr::read_csv(caminho_store, show_col_types = FALSE) |>
+    dplyr::transmute(texto = .norm_ra(.data$endereco_padronizado),
+                     regiao_adm = factor(padronizar_ra_qgis(.data$regiao_adm_correta))) |>
+    dplyr::filter(!is.na(.data$texto)) |>
+    dplyr::distinct()
+  if (nrow(dados) < k * 2) {
+    message("Poucos exemplos para CV de ", k, " folds."); return(invisible(NULL))
+  }
+
+  rec <- recipes::recipe(regiao_adm ~ texto, data = dados) |>
+    textrecipes::step_tokenize(texto, token = "character_shingle",
+                               options = list(n = n_gram, n_min = 2L)) |>
+    textrecipes::step_tokenfilter(texto, max_tokens = max_tokens) |>
+    textrecipes::step_tfidf(texto)
+  mod <- parsnip::multinom_reg(penalty = penalty, mixture = 1) |>
+    parsnip::set_engine("glmnet") |> parsnip::set_mode("classification")
+  wf <- workflows::workflow() |>
+    workflows::add_recipe(rec) |> workflows::add_model(mod)
+
+  set.seed(1)
+  folds <- rsample::vfold_cv(dados, v = k)
+  res <- tune::fit_resamples(
+    wf, folds, metrics = yardstick::metric_set(yardstick::accuracy),
+    control = tune::control_resamples(save_pred = FALSE))
+  tune::collect_metrics(res)
+}
+
+# ============================================================================
+# FLUXO DE USO TÍPICO (a cada ciclo de aprendizagem) — ver README.md
+# ----------------------------------------------------------------------------
+# source("localiza_df.R")
+# res <- localiza_df_ml(meu_df, col_bairro = "NM_BAIRRO")   # padroniza
+# bootstrap_rotulos_v2(res)                                 # rótulos "de graça"
+# coletar_rotulos_para_revisao(res, "ra_para_revisar.csv")  # exporta resíduo
+# # (humano preenche regiao_adm_correta no CSV)
+# registrar_rotulos_ra("ra_para_revisar.csv")               # incorpora
+# treinar_modelo_ra()                                       # treina/salva .rds
+# avaliar_modelo_ra()                                       # acurácia (CV)
+# ============================================================================
